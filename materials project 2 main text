@@ -1,0 +1,424 @@
+from mp_api.client import MPRester
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import numpy as np
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("MATERIALS_PROJECT_API_KEY")
+
+EARTH_ABUNDANCE = {
+    "O": 10, "Si": 9, "Al": 8, "Fe": 8, "Ca": 7,
+    "Na": 7, "K": 7, "Mg": 7, "Ti": 6, "Mn": 5,
+    "Zn": 4, "Cu": 4, "Ni": 3, "Cr": 3, "Sn": 2,
+    "Co": 2, "Pb": 2, "Mo": 1, "W": 1, "Ta": 1,
+    "Nb": 1, "Hf": 1, "Ce": 2, "Er": 1, "Gd": 1,
+    "Pt": 0, "Au": 0, "Ir": 0, "Ac": 0, "Bi": 2
+}
+
+TOXIC_ELEMENTS = ["Ac", "Tc", "Po", "At", "Rn", "Fr", "Ra",
+                   "Th", "Pa", "U", "Np", "Pu", "As", "Tl"]
+
+def get_abundance_score(formula):
+    score = 5
+    for element, value in EARTH_ABUNDANCE.items():
+        if element in formula:
+            score = min(score, value)
+    return score
+
+def is_toxic(formula):
+    return any(element in formula for element in TOXIC_ELEMENTS)
+
+def compute_semiconductor_fom(band_gap, formation_energy,
+                               energy_above_hull, abundance_score):
+    ideal_center = 1.75
+    band_gap_score = max(0, 1 - abs(band_gap - ideal_center) / 2.0)
+    stability_score = min(1.0, abs(formation_energy) / 5.0)
+    hull_score = max(0, 1 - energy_above_hull / 0.1)
+    abundance_normalized = abundance_score / 10.0
+    return round(
+        0.35 * band_gap_score +
+        0.25 * stability_score +
+        0.25 * hull_score +
+        0.15 * abundance_normalized, 4
+    )
+
+def compute_dielectric_fom(band_gap, formation_energy,
+                            energy_above_hull, abundance_score):
+    # For gate dielectrics: wide gap + stable + abundant
+    # SiO2 baseline: band_gap=8.9, formation=-9.1 eV/atom
+    gap_score = min(1.0, band_gap / 10.0)  # higher is better
+    stability_score = min(1.0, abs(formation_energy) / 5.0)
+    hull_score = max(0, 1 - energy_above_hull / 0.1)
+    abundance_normalized = abundance_score / 10.0
+    return round(
+        0.40 * gap_score +
+        0.30 * stability_score +
+        0.20 * hull_score +
+        0.10 * abundance_normalized, 4
+    )
+
+def fetch_and_process(results, mode="semiconductor"):
+    candidates = []
+    for r in results:
+        try:
+            formula = r.formula_pretty
+            if is_toxic(formula):
+                continue
+            band_gap = r.band_gap
+            formation_energy = r.formation_energy_per_atom
+            hull = r.energy_above_hull
+            density = r.density
+            crystal_system = r.symmetry.crystal_system.value
+            mat_id = str(r.material_id)
+            abundance = get_abundance_score(formula)
+
+            if mode == "semiconductor":
+                fom = compute_semiconductor_fom(
+                    band_gap, formation_energy, hull, abundance)
+            else:
+                fom = compute_dielectric_fom(
+                    band_gap, formation_energy, hull, abundance)
+
+            candidates.append({
+                "material_id": mat_id,
+                "formula": formula,
+                "band_gap_eV": round(band_gap, 3),
+                "formation_energy": round(formation_energy, 3),
+                "energy_above_hull": round(hull, 4),
+                "density_g_cm3": round(density, 3),
+                "crystal_system": crystal_system,
+                "abundance_score": abundance,
+                "figure_of_merit": fom,
+                "mode": mode
+            })
+        except Exception as e:
+            continue
+    return pd.DataFrame(candidates)
+
+# ── QUERY 1: Semiconductor candidates ─────────────────────────
+print("Fetching semiconductor candidates...")
+with MPRester(API_KEY, timeout=120) as mpr:
+    semi_results = mpr.materials.summary.search(
+        band_gap=(0.5, 2.5),
+        energy_above_hull=(0, 0.05),
+        num_elements=(2, 2),
+        num_chunks=10,
+        chunk_size=200,
+        fields=[
+            "material_id", "formula_pretty", "band_gap",
+            "formation_energy_per_atom", "density",
+            "energy_above_hull", "symmetry"
+        ]
+    )
+
+semi_df = fetch_and_process(semi_results, mode="semiconductor")
+semi_df = semi_df.sort_values("figure_of_merit", ascending=False)
+
+print(f"\n=== TOP 15 SEMICONDUCTOR CANDIDATES ===")
+print(semi_df.head(15)[["formula", "band_gap_eV",
+    "formation_energy", "figure_of_merit",
+    "crystal_system"]].to_string())
+
+# ── QUERY 2: Gate dielectric candidates ───────────────────────
+print("\nFetching gate dielectric candidates...")
+with MPRester(API_KEY, timeout=120) as mpr:
+    diel_results = mpr.materials.summary.search(
+        band_gap=(4.0, 12.0),
+        energy_above_hull=(0, 0.05),
+        num_elements=(2, 2),
+        num_chunks=10,
+        chunk_size=200,
+        fields=[
+            "material_id", "formula_pretty", "band_gap",
+            "formation_energy_per_atom", "density",
+            "energy_above_hull", "symmetry"
+        ]
+    )
+
+diel_df = fetch_and_process(diel_results, mode="dielectric")
+diel_df = diel_df.sort_values("figure_of_merit", ascending=False)
+
+print(f"\n=== TOP 15 GATE DIELECTRIC CANDIDATES ===")
+print(f"(SiO2 baseline: band_gap=8.9eV, seeking higher k alternatives)")
+print(diel_df.head(15)[["formula", "band_gap_eV",
+    "formation_energy", "figure_of_merit",
+    "crystal_system"]].to_string())
+
+# ── NOVELTY DETECTION on combined dataset ─────────────────────
+print("\nBuilding novelty baseline...")
+with MPRester(API_KEY, timeout=120) as mpr:
+    baseline_results = mpr.materials.summary.search(
+        num_elements=(2, 3),
+        num_chunks=20,
+        chunk_size=200,
+        fields=[
+            "material_id", "formula_pretty", "band_gap",
+            "formation_energy_per_atom", "density",
+            "energy_above_hull"
+        ]
+    )
+
+baseline_data = []
+for r in baseline_results:
+    try:
+        baseline_data.append({
+            "band_gap_eV": r.band_gap,
+            "formation_energy": r.formation_energy_per_atom,
+            "energy_above_hull": r.energy_above_hull,
+            "density_g_cm3": r.density,
+        })
+    except:
+        continue
+
+baseline_df = pd.DataFrame(baseline_data).dropna()
+feature_cols = ["band_gap_eV", "formation_energy",
+                "energy_above_hull", "density_g_cm3"]
+
+scaler = StandardScaler()
+X_baseline = scaler.fit_transform(baseline_df[feature_cols])
+detector = OneClassSVM(kernel="rbf", nu=0.05, gamma="scale")
+detector.fit(X_baseline)
+print(f"Baseline trained on {len(baseline_df)} materials")
+
+# Score dielectric candidates for novelty
+diel_clean = diel_df[feature_cols].dropna()
+diel_scores = detector.score_samples(scaler.transform(diel_clean))
+diel_df_scored = diel_df.loc[diel_clean.index].copy()
+diel_df_scored["novelty_score"] = diel_scores
+diel_df_scored["is_novel"] = diel_scores < np.percentile(
+    diel_scores, 10)
+
+print(f"\n=== NOVEL GATE DIELECTRIC CANDIDATES ===")
+print("High FOM + statistically unusual vs full database:")
+novel_diel = diel_df_scored[
+    diel_df_scored["is_novel"]
+].sort_values("figure_of_merit", ascending=False)
+print(novel_diel[["formula", "band_gap_eV",
+    "formation_energy", "figure_of_merit",
+    "novelty_score", "crystal_system"]].head(10).to_string())
+
+# ── SAVE ALL OUTPUTS ──────────────────────────────────────────
+semi_df.to_csv("semiconductor_candidates.csv", index=False)
+diel_df.to_csv("dielectric_candidates.csv", index=False)
+novel_diel.to_csv("novel_dielectric_candidates.csv", index=False)
+
+print("\n=== FILES SAVED ===")
+print("semiconductor_candidates.csv")
+print("dielectric_candidates.csv")
+print("novel_dielectric_candidates.csv")
+print("\nNext: Cross-reference novel dielectric candidates")
+print("against published literature to find unstudied ones.")
+
+
+# Query dielectric properties for top candidates
+target_formulas = ["YF3", "PrF3", "NdF3", "DyF3", "TbF3"]
+
+with MPRester(API_KEY, timeout=120) as mpr:
+    for formula in target_formulas:
+        try:
+            results = mpr.materials.dielectric.search(
+                fields=[
+                    "material_id",
+                    "formula_pretty",
+                    "e_total",      # static dielectric constant
+                    "e_electronic", # electronic contribution
+                    "e_ionic",      # ionic contribution
+                    "n"             # refractive index
+                ]
+            )
+            
+            for r in results:
+                if formula in r.formula_pretty:
+                    print(f"\n{r.formula_pretty}:")
+                    print(f"  Static dielectric constant: {r.e_total}")
+                    print(f"  Electronic contribution: {r.e_electronic}")
+                    print(f"  Ionic contribution: {r.e_ionic}")
+                    print(f"  Refractive index n: {r.n}")
+        except Exception as e:
+            print(f"Error fetching {formula}: {e}")
+
+
+# Check if fluoride is more stable than competing hydroxide
+# for your top candidates
+humidity_stability_check = {
+    "YF3": "Y(OH)3",   # competing hydrated phase
+    "PrF3": "Pr(OH)3",
+    "NdF3": "Nd(OH)3",
+    "DyF3": "Dy(OH)3",
+}
+
+with MPRester(API_KEY, timeout=120) as mpr:
+    for fluoride, hydroxide in humidity_stability_check.items():
+        print(f"\nChecking {fluoride} vs {hydroxide}:")
+        
+        # Get fluoride stability
+        f_results = mpr.materials.summary.search(
+            formula=fluoride,
+            fields=["formula_pretty", "formation_energy_per_atom",
+                   "energy_above_hull", "band_gap"]
+        )
+        
+        # Get hydroxide stability  
+        h_results = mpr.materials.summary.search(
+            formula=hydroxide,
+            fields=["formula_pretty", "formation_energy_per_atom",
+                   "energy_above_hull"]
+        )
+        
+        for r in f_results[:1]:
+            print(f"  {r.formula_pretty}: "
+                  f"formation={r.formation_energy_per_atom:.3f} eV/atom, "
+                  f"hull={r.energy_above_hull:.4f}, "
+                  f"gap={r.band_gap:.3f} eV")
+        
+        for r in h_results[:1]:
+            print(f"  {r.formula_pretty}: "
+                  f"formation={r.formation_energy_per_atom:.3f} eV/atom")
+            
+
+
+import pandas as pd
+
+def compute_humidity_stability_score(fluoride_formation, 
+                                      hydroxide_formation):
+    """
+    More negative fluoride formation vs hydroxide means
+    fluoride is preferred thermodynamically in wet conditions.
+    Returns positive score if fluoride is more stable.
+    """
+    # Both values are per atom, need to normalize by formula units
+    # Approximate: if fluoride formation << hydroxide formation
+    # the material resists hydration
+    delta = hydroxide_formation - fluoride_formation
+    return round(delta, 4)  # positive means fluoride preferred
+
+# Reference hydroxide formation energies from literature
+# (eV per atom, approximate DFT values)
+HYDROXIDE_FORMATION = {
+    "Y":  -3.21,   # Y(OH)3
+    "Pr": -3.18,   # Pr(OH)3
+    "Nd": -3.15,   # Nd(OH)3
+    "Dy": -3.12,   # Dy(OH)3
+    "Tb": -3.14,   # Tb(OH)3
+    "Ho": -3.11,   # Ho(OH)3
+    "Sm": -3.09,   # Sm(OH)3
+    "Lu": -3.19,   # Lu(OH)3
+}
+
+# Your top candidates from the dielectric run
+top_candidates = {
+    "YF3":  {"formation": -4.469, "band_gap": 7.546, "metal": "Y"},
+    "PrF3": {"formation": -4.437, "band_gap": 7.597, "metal": "Pr"},
+    "NdF3": {"formation": -4.452, "band_gap": 7.616, "metal": "Nd"},
+    "DyF3": {"formation": -4.500, "band_gap": 7.776, "metal": "Dy"},
+    "TbF3": {"formation": -4.503, "band_gap": 7.755, "metal": "Tb"},
+    "HoF3": {"formation": -4.494, "band_gap": 7.748, "metal": "Ho"},
+    "SmF3": {"formation": -4.468, "band_gap": 7.730, "metal": "Sm"},
+    "LuF3": {"formation": -4.449, "band_gap": 7.690, "metal": "Lu"},
+}
+
+print("=== HUMIDITY STABILITY ANALYSIS ===")
+print("Positive score = fluoride more stable than hydroxide")
+print("Higher score = better humidity resistance\n")
+
+results = []
+for formula, props in top_candidates.items():
+    metal = props["metal"]
+    if metal in HYDROXIDE_FORMATION:
+        stability = compute_humidity_stability_score(
+            props["formation"],
+            HYDROXIDE_FORMATION[metal]
+        )
+        results.append({
+            "formula": formula,
+            "band_gap_eV": props["band_gap"],
+            "fluoride_formation": props["formation"],
+            "hydroxide_formation": HYDROXIDE_FORMATION[metal],
+            "humidity_stability_score": stability
+        })
+
+humidity_df = pd.DataFrame(results).sort_values(
+    "humidity_stability_score", ascending=False)
+
+print(humidity_df.to_string(index=False))
+
+# Combined score: gate dielectric quality + humidity resistance
+humidity_df["combined_score"] = (
+    humidity_df["band_gap_eV"] / 10.0 * 0.5 +
+    humidity_df["humidity_stability_score"] / 2.0 * 0.5
+)
+
+print("\n=== FINAL RANKING: Gate Quality + Humidity Resistance ===")
+print(humidity_df.sort_values(
+    "combined_score", ascending=False
+)[["formula", "band_gap_eV", 
+   "humidity_stability_score", 
+   "combined_score"]].to_string(index=False))
+
+import requests
+
+def search_patents(query, max_results=10):
+    """
+    Search USPTO PatentsView API for existing patents
+    Free, no API key required
+    """
+    url = "https://search.patentsview.org/api/v1/patent/"
+    
+    params = {
+        "q": {"_text_any": {"patent_abstract": query}},
+        "f": ["patent_id", "patent_title", "patent_abstract",
+              "patent_date", "assignee_organization"],
+        "o": {"per_page": max_results}
+    }
+    
+    try:
+        response = requests.post(url, json=params)
+        data = response.json()
+        patents = data.get("patents", [])
+        
+        if not patents:
+            print(f"No patents found for: {query}")
+            return []
+        
+        results = []
+        for p in patents:
+            results.append({
+                "id": p.get("patent_id"),
+                "title": p.get("patent_title"),
+                "date": p.get("patent_date"),
+                "assignee": p.get("assignee_organization", 
+                                  [{}])[0].get(
+                                  "assignee_organization", "Unknown"),
+                "abstract": p.get("patent_abstract", "")[:200]
+            })
+        return results
+    
+    except Exception as e:
+        print(f"Patent search error: {e}")
+        return []
+
+# Run your specific searches
+queries = [
+    "rare earth fluoride gate dielectric agricultural sensor",
+    "yttrium fluoride low power sensor humidity",
+    "dysprosium fluoride dielectric insulator",
+    "rare earth trifluoride transistor gate",
+    "fluoride gate dielectric soil sensor"
+]
+
+print("=== PATENT LANDSCAPE SEARCH ===\n")
+for query in queries:
+    print(f"Query: '{query}'")
+    results = search_patents(query)
+    if results:
+        for r in results[:3]:
+            print(f"  FOUND: {r['title']} ({r['date']})")
+            print(f"  Assignee: {r['assignee']}")
+            print(f"  Abstract: {r['abstract']}...")
+    else:
+        print(f"  CLEAR — no patents found")
+    print()
